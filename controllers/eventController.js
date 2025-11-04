@@ -3,7 +3,9 @@ const Event = require('../models/Event');
 const User = require('../models/User');
 const { notify } = require('../utils/notify');
 const redisClient = require('../config/redis');
+const { insertEvent, updateEvent, deleteEvent } = require('../utils/googleCalendar');
 
+// Helper: check overlap for a given email (creator or participant)
 async function hasOverlap(email, startTime, endTime) {
     const query = {
         canceled: false,
@@ -22,6 +24,7 @@ async function hasOverlap(email, startTime, endTime) {
     return (creatorMatches.length + participantMatches.length) > 0;
 }
 
+// CREATE EVENT
 const createEvent = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -33,6 +36,7 @@ const createEvent = async (req, res) => {
         const creator = await User.findById(req.user._id);
         if (!creator) return res.status(400).json({ message: 'Creator not found' });
 
+        // Prevent overlaps
         const creatorOverlap = await hasOverlap(creator.email, startTime, endTime);
         if (creatorOverlap) {
             await session.abortTransaction();
@@ -58,24 +62,46 @@ const createEvent = async (req, res) => {
             participants: participants.map(e => ({ email: e })),
             creator: creator._id,
             isRecurring,
-            recurringDates: isRecurring ? recurringDates : []
+            recurringDates: isRecurring ? recurringDates : [],
+            organizerEmail: creator.email
         });
+
+        // Sync to Google Calendar if user connected
+        if (creator.google && creator.google.tokens) {
+            try {
+                const gEvent = {
+                    summary: title,
+                    description: description || '',
+                    start: { dateTime: new Date(startTime).toISOString() },
+                    end: { dateTime: new Date(endTime).toISOString() },
+                    location: location || undefined,
+                    attendees: participants.map(p => ({ email: p }))
+                };
+                const calendarId = process.env.GOOGLE_DEFAULT_CALENDAR || 'primary';
+                const inserted = await insertEvent(creator.google.tokens, calendarId, gEvent);
+                event.googleEventId = inserted.id;
+            } catch (gErr) {
+                console.error('Google create failed', gErr);
+            }
+        }
 
         await event.save({ session });
 
         for (const p of event.participants) {
-            await notify({ toEmail: p.email, subject: `Invited: ${event.title} `, body: `You are invited to ${event.title} from ${event.startTime} to ${event.endTime} ` });
+            await notify({
+                toEmail: p.email,
+                subject: `Invited: ${event.title}`,
+                body: `You are invited to ${event.title} from ${event.startTime} to ${event.endTime}`
+            });
         }
 
-        const ttlKeyParts = ['events', creator._id.toString(), JSON.stringify({})];
-        const key = ttlKeyParts.join(':');
+        // Invalidate Redis cache
+        const key = ['events', creator._id.toString(), JSON.stringify({})].join(':');
         await redisClient.del(key).catch(() => { });
 
         await session.commitTransaction();
         session.endSession();
         res.status(201).json(event);
-
-
     } catch (err) {
         await session.abortTransaction();
         session.endSession();
@@ -84,11 +110,11 @@ const createEvent = async (req, res) => {
     }
 };
 
+// GET EVENTS (cached)
 const getEvents = async (req, res) => {
     try {
         const userEmail = req.user.email;
         const { from, to, participant } = req.query;
-
 
         const q = { canceled: false, $or: [{ 'participants.email': userEmail }, { creator: req.user._id }] };
         if (participant) q['participants.email'] = participant;
@@ -104,14 +130,13 @@ const getEvents = async (req, res) => {
         }
 
         res.json(events);
-
-
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'Server error' });
     }
 };
 
+// GET EVENT BY ID
 const getEventById = async (req, res) => {
     try {
         const { id } = req.params;
@@ -124,58 +149,55 @@ const getEventById = async (req, res) => {
     }
 };
 
+// UPDATE EVENT
 const updateEvent = async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
     try {
         const { id } = req.params;
         const data = req.body;
-        const event = await Event.findById(id);
+        const event = await Event.findById(id).populate('creator');
         if (!event) {
             await session.abortTransaction();
             session.endSession();
             return res.status(404).json({ message: 'Event not found' });
         }
 
-        if (event.creator.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+        if (event.creator._id.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
             await session.abortTransaction();
             session.endSession();
             return res.status(403).json({ message: 'Not allowed' });
         }
 
-        if (data.startTime || data.endTime) {
-            const newStart = data.startTime ? new Date(data.startTime) : event.startTime;
-            const newEnd = data.endTime ? new Date(data.endTime) : event.endTime;
-            if (newEnd <= newStart) {
-                await session.abortTransaction();
-                session.endSession();
-                return res.status(400).json({ message: 'endTime must be after startTime' });
-            }
+        // Merge new data
+        Object.assign(event, data);
 
-            const overlapping = await Event.findOne({
-                _id: { $ne: event._id },
-                canceled: false,
-                $and: [{ startTime: { $lt: newEnd } }, { endTime: { $gt: newStart } }],
-                $or: [{ 'participants.email': req.user.email }, { creator: req.user._id }]
-            });
-            if (overlapping) {
-                await session.abortTransaction();
-                session.endSession();
-                return res.status(400).json({ message: 'Updated times cause overlap' });
+        // Sync to Google Calendar if connected
+        if (event.googleEventId && event.creator.google && event.creator.google.tokens) {
+            try {
+                const calendarId = process.env.GOOGLE_DEFAULT_CALENDAR || 'primary';
+                const gEvent = {
+                    summary: event.title,
+                    description: event.description || '',
+                    start: { dateTime: new Date(event.startTime).toISOString() },
+                    end: { dateTime: new Date(event.endTime).toISOString() },
+                    location: event.location || undefined,
+                    attendees: event.participants.map(p => ({ email: p.email }))
+                };
+                await updateEvent(event.creator.google.tokens, calendarId, event.googleEventId, gEvent);
+            } catch (gErr) {
+                console.error('Google update failed', gErr);
             }
         }
 
-        Object.assign(event, data);
         await event.save({ session });
 
-        const key = ['events', event.creator.toString(), JSON.stringify({})].join(':');
+        const key = ['events', event.creator._id.toString(), JSON.stringify({})].join(':');
         await redisClient.del(key).catch(() => { });
 
         await session.commitTransaction();
         session.endSession();
         res.json(event);
-
-
     } catch (err) {
         await session.abortTransaction();
         session.endSession();
@@ -184,26 +206,43 @@ const updateEvent = async (req, res) => {
     }
 };
 
-const deleteEvent = async (req, res) => {
+// DELETE EVENT
+const deleteEventController = async (req, res) => {
     try {
         const { id } = req.params;
-        const event = await Event.findById(id);
+        const event = await Event.findById(id).populate('creator');
         if (!event) return res.status(404).json({ message: 'Event not found' });
 
-        if (event.creator.toString() !== req.user._id.toString() && req.user.role !== 'admin') return res.status(403).json({ message: 'Not allowed' });
+        if (event.creator._id.toString() !== req.user._id.toString() && req.user.role !== 'admin')
+            return res.status(403).json({ message: 'Not allowed' });
 
         event.canceled = true;
         await event.save();
 
-        const key = ['events', event.creator.toString(), JSON.stringify({})].join(':');
+        // Delete from Google Calendar if synced
+        if (event.googleEventId && event.creator.google && event.creator.google.tokens) {
+            try {
+                const calendarId = process.env.GOOGLE_DEFAULT_CALENDAR || 'primary';
+                await deleteEvent(event.creator.google.tokens, calendarId, event.googleEventId);
+            } catch (gErr) {
+                console.error('Google delete failed', gErr);
+            }
+        }
+
+        const key = ['events', event.creator._id.toString(), JSON.stringify({})].join(':');
         await redisClient.del(key).catch(() => { });
 
         res.json({ message: 'Event canceled' });
-
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'Server error' });
     }
 };
 
-module.exports = { createEvent, getEvents, getEventById, updateEvent, deleteEvent };
+module.exports = {
+    createEvent,
+    getEvents,
+    getEventById,
+    updateEvent,
+    deleteEvent: deleteEventController
+};
